@@ -1,0 +1,264 @@
+import torch
+import torch.nn as nn
+import math
+
+d_model = 512   # Embedding_dim, Encoder Decoder Input and Output.
+num_layers = 6   # In Transformer model, the composition of Encoder Decoder layers
+num_heads = 8   # Implementing Attention in parallel
+d_ff = 2048   # Hidden Layer units
+seq_len = 5000
+device = torch.cuda if torch.cuda.is_available() else torch.device('cpu')
+
+# 위치 정보를 반영해주는 클래스.
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, seq_len):
+        super().__init__()
+        self.d_model = d_model
+        self.seq_len = seq_len
+        position = torch.arange(0, seq_len, dtype = torch.float).unsqueeze(1)
+        index = torch.arange(0, d_model, dtype = torch.float).unsqueeze(1)
+
+        self.pe = torch.zeros(seq_len, d_model)   # Initialize Positional Encoding to zero
+
+        self.pe[:, 0::2] = torch.sin(position / (10000 ** (2 * index / d_model)))
+        self.pe[:, 1::2] = torch.cos(position / (10000 ** (2 * index / d_model)))
+
+    def forward(self, x):   # x means embedding_matrix
+        output = x + self.pe
+        return output
+    
+
+class MultiheadSelfAttention(nn.Module):
+    def __init__(self, d_model, num_heads, seq_len):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.seq_len = seq_len
+        self.weightQ = nn.ModuleList([nn.Linear(d_model, (d_model // num_heads)) for _ in range(num_heads)])
+        self.weightK = nn.ModuleList([nn.Linear(d_model, (d_model // num_heads)) for _ in range(num_heads)])
+        self.weightV = nn.ModuleList([nn.Linear(d_model, (d_model // num_heads)) for _ in range(num_heads)])
+        self.weightO = nn.Linear(d_model, d_model)
+        self.softmax = nn.Softmax(dim = -1)   # Do Softmax function for column
+
+
+    def forward(self, input, mask = None):
+        tip = []
+
+        # This is a conceptual implementation of paper 'Attention is all you need', Not for efficiency
+        for i in range(self.num_heads):
+            query = self.weightQ[i](input)
+            key = self.weightK[i](input)
+            value = self.weightV[i](input)
+
+            key = torch.transpose(key, -2, -1)
+
+            attention_score_matrix = torch.matmul(query, key) / math.sqrt(self.d_model // self.num_heads)
+            if mask is not None:
+                attention_score_matrix = attention_score_matrix.masked_fill(mask == 0, -1e9)
+
+            attention_score_matrix = self.softmax(attention_score_matrix)
+
+            attention_value_matrix = torch.matmul(attention_score_matrix, value)
+
+            tip.append(attention_value_matrix)
+
+        self.concatenated_matrix = torch.cat(tip, dim = 1)
+
+        # multihead_attention_matrix.shape = (seq_len, d_model)
+        return self.weightO(self.concatenated_matrix)
+    
+
+class MaskedMultiheadSelfAttention(nn.Module):
+    def __init__(self, d_model, num_heads, seq_len):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.seq_len = seq_len
+        self.weightQ = nn.ModuleList([nn.Linear(d_model, (d_model // num_heads)) for _ in range(num_heads)])
+        self.weightK = nn.ModuleList([nn.Linear(d_model, (d_model // num_heads)) for _ in range(num_heads)])
+        self.weightV = nn.ModuleList([nn.Linear(d_model, (d_model // num_heads)) for _ in range(num_heads)])
+        self.weightO = nn.Linear(d_model, d_model)
+        self.softmax = nn.Softmax(dim = 1)   # Do Softmax function for column
+
+
+    def forward(self, input, mask = None):
+        tip = []
+
+        for i in range(self.num_heads):
+            query = self.weightQ[i](input)
+            key = self.weightK[i](input)
+            value = self.weightV[i](input)
+
+            key = torch.transpose(key, 0, 1)
+
+            attention_score_matrix = torch.matmul(query, key) / math.sqrt(self.d_model // self.num_heads)
+
+            # Look-ahead mask implement.
+            # First, construct a Mask matrix. In a bottom fill it with one, and on the top fill it with zero
+            # Second, use that mask matrix to fill in the attention score matrix value.
+            if mask is not None:
+                look_ahead_mask = ~torch.tril(torch.ones(self.seq_len, self.seq_len)).bool().to(device)
+                attention_score_matrix.masked_fill_(look_ahead_mask, float("-inf"))
+
+            attention_score_matrix = self.softmax(attention_score_matrix)
+
+            attention_value_matrix = torch.matmul(attention_score_matrix, value)
+
+            tip.append(attention_value_matrix)
+
+        self.concatenated_matrix = torch.cat(tip, dim = 1)
+
+        # multihead_attention_matrix.shape = (seq_len, d_model)
+        return self.weightO(self.concatenated_matrix)
+    
+
+class MultiheadEncoderDecoderAttention(nn.Module):
+    def __init__(self, seq_len, d_model, num_heads):   # Key, Value from Encoder, Query from Decoder.
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.seq_len = seq_len
+        self.weightQ = nn.ModuleList([nn.Linear(d_model, (d_model // num_heads)) for _ in range(num_heads)])
+        self.weightK = nn.ModuleList([nn.Linear(d_model, (d_model // num_heads)) for _ in range(num_heads)])
+        self.weightV = nn.ModuleList([nn.Linear(d_model, (d_model // num_heads)) for _ in range(num_heads)])
+        self.weightO = nn.Linear(d_model, d_model)
+        self.softmax = nn.Softmax(dim = 1)   # Do Softmax function for column
+
+
+    def forward(self, key, value, query, mask = None):
+        tip = []
+
+        for i in range(self.num_heads):
+            query = self.weightQ[i](query)
+            key = self.weightK[i](key)
+            value = self.weightV[i](value)
+
+            key = torch.transpose(key, 0, 1)
+
+            attention_score_matrix = torch.matmul(query, key) / math.sqrt(self.d_model // self.num_heads)
+            if mask is not None:
+                attention_score_matrix = attention_score_matrix.masked_fill(mask == 0, -1e9)
+
+            attention_score_matrix = self.softmax(attention_score_matrix)
+
+            attention_value_matrix = torch.matmul(attention_score_matrix, value)
+
+            tip.append(attention_value_matrix)
+
+        self.concatenated_matrix = torch.cat(tip, dim = 1)
+
+        # multihead_attention_matrix.shape = (seq_len, d_model)
+        return self.weightO(self.concatenated_matrix)
+    
+
+class FeedForward(nn.Module):   # x = Multi-head attention output, shape = (seq_len, d_model)
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.weight1 = nn.Linear(d_model, d_ff)
+        self.weight2 = nn.Linear(d_ff, d_model)
+        self.relu = nn.ReLU()
+
+
+    def forward(self, x):
+        f1 = self.weight1(x)
+        f2 = self.relu(f1)
+        f3 = self.weight2(f2)
+        return f3
+    
+
+class AddNorm(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(d_model))
+        self.beta = nn.Parameter(torch.zeros(d_model))
+        self.e = 1e-9
+
+
+    def forward(self, input, output):
+        residual_connection_output = input + output   # H(x)
+
+        average = torch.mean(residual_connection_output, dim = -1, keepdim = True)
+        variance = torch.var(residual_connection_output, dim = -1, unbiased = False, keepdim = True)
+
+        layerNorm = (residual_connection_output - average) / torch.sqrt(variance + self.e)
+
+        return self.gamma * layerNorm + self.beta   # return LayerNormalization
+    
+
+# Encoder의 Input은 seq_len * embedding_dim, output의 크기도 input과 같다.
+
+class Encoder(nn.Module):
+    def __init__(self, d_model, num_heads, seq_len):
+        super().__init__()
+        # Weight Matrix of each Query, Key, Value.
+        # Input size = batch_size, seq_len, d_model
+        self.multiHeadSelfAttention = MultiheadSelfAttention(d_model, num_heads, seq_len)   # Output size = batch_size ,seq_len, d_model
+        self.addNorm1 = AddNorm(d_model)
+        self.ffnn = FeedForward(seq_len, d_model)
+        self.addNorm2 = AddNorm(d_model)
+
+    def forward(self, pe_output):
+        attentionOutput = self.multiheadSelfAttention(pe_output)
+        addNormOutput = self.addNorm1(pe_output, attentionOutput)
+        ffnnOutput = self.ffnn(addNormOutput)
+        addNormOutput2 = self.addNorm2(addNormOutput, ffnnOutput)
+        return addNormOutput2
+    
+
+# Decoder
+
+class Decoder(nn.Module):
+    def __init__(self, d_model, num_heads, seq_len):
+        super().__init__()
+        self.maskedAttention = MaskedMultiheadSelfAttention(input, d_model, num_heads, seq_len)
+        self.addNorm1 = AddNorm(d_model)
+        self.multiHeadAttention = MultiheadEncoderDecoderAttention(seq_len, d_model, num_heads)
+        self.addNorm2 = AddNorm(d_model)
+        self.ffnn = FeedForward()
+        self.addNorm3 = AddNorm(d_model)
+
+    def forward(self, pe_output, encoderOutput):
+        maskedAttentionOutput = self.maskedAttention(pe_output)
+        addNormOutput1 = self.addNorm1(pe_output, maskedAttentionOutput)
+        mulHeadAtten = self.multiHeadAttention(encoderOutput, encoderOutput, addNormOutput1)
+        addNormOutput2 = self.addNorm2(addNormOutput1, mulHeadAtten)
+        ffnnOutput = self.ffnn(addNormOutput2)
+        addNormOutput3 = self.addNorm3(addNormOutput2, ffnnOutput)
+        return addNormOutput3
+    
+
+# Composition of Implementation of Encoder and Decoder at the top
+
+class Transformers(nn.Module):
+    def __init__(self, batch_size, vocab_size, seq_len, d_model, d_ff):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pe = PositionalEncoding(d_model, seq_len)
+        self.encoder_layers = nn.ModuleList([
+            Encoder(d_model, num_heads, seq_len) for _ in range(num_layers)
+        ])
+        self.decoder_layers = nn.ModuleList([
+            Decoder(d_model, num_heads, seq_len) for _ in range(num_layers)
+        ])
+        # Output of the Decoder is (batch_size, seq_len, d_model)
+        self.dense = nn.Linear(d_model, vocab_size)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, encoder_input, decoder_input):
+        # Embedding and positional encoding
+        encoder_embeddings = self.embedding(encoder_input)
+        decoder_embeddings = self.embedding(decoder_input)
+        encoder_output = self.pe(encoder_embeddings)
+        decoder_output = self.pe(decoder_embeddings)
+
+        for encoder in self.encoder_layers:
+            encoder_output = encoder(encoder_output)
+                
+        for decoder in self.decoder_layers:
+            decoder_output = decoder(decoder_output, encoder_output)
+
+        output = self.dense(decoder_output)
+        output = self.softmax(output)
+
+        return output
